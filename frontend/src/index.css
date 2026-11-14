@@ -1,0 +1,50 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+@import 'maplibre-gl/dist/maplibre-gl.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --bhima-bg: #F7F8F6;
+    --bhima-surface: #FFFFFF;
+    --bhima-text: #202824;
+    --bhima-muted: #69736D;
+    --bhima-primary: #31594B;
+    --bhima-secondary: #84978B;
+    --bhima-border: #E4E8E4;
+    --bhima-subtle: #EEF1ED;
+  }
+
+  body {
+    background-color: var(--bhima-bg);
+    color: var(--bhima-text);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    letter-spacing: -0.011em;
+  }
+}
+
+/* Custom subtle scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #D8DDD8;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #84978B;
+}
+
+/* Remove default MapLibre canvas outline */
+.maplibregl-canvas {
+  outline: none;
+}

@@ -1,0 +1,15 @@
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+tests/
+.pytest_cache/
+data/raw_parquet/
+data/storage/
+*.parquet
+*.nc
+*.h5
+.git/
+Dockerfile*
+.dockerignore

@@ -1,0 +1,33 @@
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: bhima-preprocessor-job
+  annotations:
+    run.googleapis.com/description: "BHIMA Offline Earth Observation Ingestion and GCS Preprocessing Worker"
+spec:
+  template:
+    spec:
+      taskCount: 1
+      template:
+        spec:
+          timeoutSeconds: 1800
+          maxRetries: 3
+          serviceAccountName: bhima-cloudrun-sa@PROJECT_ID.iam.gserviceaccount.com
+          containers:
+            - image: us-central1-docker.pkg.dev/PROJECT_ID/bhima-registry/bhima-backend:latest
+              command: ["python", "-u", "scripts/preprocess_and_upload.py"]
+              resources:
+                limits:
+                  cpu: "4"
+                  memory: "4Gi"
+              env:
+                - name: ENVIRONMENT
+                  value: "production"
+                - name: STORAGE_BACKEND
+                  value: "gcs"
+                - name: BHIMA_GCS_BUCKET
+                  value: "bhima-observations-PROJECT_ID"
+                - name: GCP_PROJECT_ID
+                  value: "PROJECT_ID"
+                - name: NUM_WORKERS
+                  value: "8"

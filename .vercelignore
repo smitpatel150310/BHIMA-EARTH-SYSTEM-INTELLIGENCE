@@ -1,0 +1,17 @@
+backend/venv/
+backend/.venv/
+backend/env/
+frontend/node_modules/
+frontend/dist/
+.git/
+.vscode/
+.pytest_cache/
+backend/tests/
+backend/data/raw_parquet/
+backend/data/storage/
+*.parquet
+*.nc
+*.h5
+Dockerfile*
+.dockerignore
+docker-compose.yml

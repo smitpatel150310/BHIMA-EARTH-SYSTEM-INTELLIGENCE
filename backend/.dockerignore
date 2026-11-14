@@ -1,0 +1,24 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+venv/
+.venv/
+env/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+service_account.json
+credentials.json
+
+# Scratch & temporary logs
+*.log
+scratch/
