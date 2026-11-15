@@ -179,10 +179,35 @@ def get_cached_gpm_dataset():
 
         asset = collection.assets["zarr-abfs"]
         storage_options = asset.extra_fields.get("xarray:storage_options", {})
-        open_kwargs = asset.extra_fields.get("xarray:open_kwargs", {})
+        open_kwargs = dict(asset.extra_fields.get("xarray:open_kwargs", {}))
+        open_kwargs.setdefault("use_cftime", True)
+        open_kwargs.setdefault("consolidated", True)
 
         fs = fsspec.get_mapper(asset.href, **storage_options)
-        ds = xr.open_zarr(fs, **open_kwargs)
+
+        try:
+            ds = xr.open_zarr(fs, **open_kwargs)
+        except Exception as decode_err:
+            logger.warning(
+                f"Failed to open GPM IMERG Zarr store with default time decoding: {decode_err}. "
+                "Retrying with decode_times=False and explicit cftime coordinate decoding..."
+            )
+            fallback_kwargs = dict(open_kwargs)
+            fallback_kwargs["decode_times"] = False
+            ds = xr.open_zarr(fs, **fallback_kwargs)
+            if "time" in ds.coords:
+                units = ds.time.attrs.get("units", "minutes since 2000-06-01 00:00:00")
+                calendar = ds.time.attrs.get("calendar", "julian")
+                try:
+                    import cftime
+                    decoded_times = cftime.num2date(ds.time.values, units=units, calendar=calendar)
+                    ds["time"] = ("time", decoded_times, ds.time.attrs)
+                    logger.info("Successfully decoded GPM time coordinates via fallback cftime.num2date.")
+                except Exception as cf_err:
+                    logger.error(f"Explicit cftime decoding failed: {cf_err}")
+                    raise NASADataAccessError(
+                        f"Unable to decode GPM IMERG time coordinate ({units}, calendar={calendar}): {cf_err}"
+                    )
 
         _gpm_zarr_ds = ds
         logger.info("Microsoft Planetary Computer GPM IMERG Zarr store initialized successfully.")
@@ -284,6 +309,32 @@ class NASADataAccessor:
             "coverage_fraction": [1.0] * len(months)
         })
 
+        region_key = get_region_key(min_lon, min_lat, max_lon, max_lat)
+        records = [
+            {
+                "date": row["date"],
+                "value": row["value"],
+                "valid_pixels": int(row["valid_pixels"]),
+                "coverage_fraction": float(row["coverage_fraction"]),
+                "data_provenance": "SYNTHETIC_DEMO_DATA",
+                "data_source": "Synthetic Offline Fallback Generator",
+            }
+            for _, row in df.iterrows()
+        ]
+        try:
+            persistent_store.persist_monthly_series(
+                dataset_id="MOD11C3_061",
+                region_key=region_key,
+                records=records,
+                variable="land_surface_temperature",
+                aggregation_method="SYNTHETIC_OFFLINE_ESTIMATE",
+                data_provenance="SYNTHETIC_DEMO_DATA",
+                data_source="Synthetic Offline Fallback Generator",
+                units="Kelvin",
+            )
+        except Exception as p_err:
+            logger.warning(f"Could not persist synthetic series to store: {p_err}")
+
         notes = [
             "PROVENANCE: SYNTHETIC_DEMO_DATA — Offline demonstration mode",
             "This synthetic series is generated for testing and does NOT represent measured satellite observations",
@@ -304,27 +355,42 @@ class NASADataAccessor:
         dataset_id: str,
         min_lon: float, max_lon: float,
         min_lat: float, max_lat: float,
-        start_date: str, end_date: str
+        start_date: str, end_date: str,
+        region_name: Optional[str] = None
     ) -> Tuple[pd.DataFrame, List[str], str, str, Dict[str, Any]]:
         """
-        Unified entry point for retrieving regional time series data.
-        Routes to the appropriate provider (GPM, TerraClimate, etc.) with SQLite caching.
+        Cache-first entry point for retrieving regional time series data.
+        Reads pre-collected 72-month observations directly from local cache with zero external API calls.
         """
         if dataset_id == "terraclimate":
             dataset_id = "terraclimate_ppt"
 
-        if dataset_id == "GPM_3IMERGM_07":
-            return self.get_gpm_mpc_monthly(min_lon, max_lon, min_lat, max_lat, start_date, end_date)
-        elif dataset_id == "terraclimate_ppt":
-            return self.get_terraclimate_mpc_monthly("ppt", min_lon, max_lon, min_lat, max_lat, start_date, end_date, dataset_id=dataset_id)
-        elif dataset_id == "terraclimate_soil":
-            return self.get_terraclimate_mpc_monthly("soil", min_lon, max_lon, min_lat, max_lat, start_date, end_date, dataset_id=dataset_id)
-        elif dataset_id == "terraclimate_tmax":
-            return self.get_terraclimate_mpc_monthly("tmax", min_lon, max_lon, min_lat, max_lat, start_date, end_date, dataset_id=dataset_id)
-        elif dataset_id == "MOD11C3_061":
+        # 1. Primary Cache-First Reading Service
+        from app.core.cache_reader import cache_reading_service
+        try:
+            return cache_reading_service.read_regional_series(
+                dataset_id=dataset_id,
+                min_lon=min_lon,
+                min_lat=min_lat,
+                max_lon=max_lon,
+                max_lat=max_lat,
+                start_date=start_date,
+                end_date=end_date,
+                region_name=region_name,
+            )
+        except Exception as cache_err:
+            logger.info(f"Local observation cache query notice: {cache_err}")
+
+        # 2. Secondary fallback for synthetic demo datasets (e.g. MOD11C3 demo)
+        if dataset_id == "MOD11C3_061":
             return self.get_synthetic_precipitation(min_lon, max_lon, min_lat, max_lat, start_date, end_date)
-        else:
-            raise NASADataAccessError(f"Dataset '{dataset_id}' is not supported.")
+
+        # 3. If cache does not have the region, return a clear descriptive error instead of attempting remote live extraction
+        raise NASADataAccessError(
+            f"No pre-collected observation records found for region '{region_name or 'custom'}' "
+            f"([{min_lon:.2f}, {min_lat:.2f}, {max_lon:.2f}, {max_lat:.2f}]). "
+            f"Please select one of the target regions from the dropdown."
+        )
 
     def get_gpm_mpc_monthly(
         self,
@@ -399,7 +465,8 @@ class NASADataAccessor:
 
             def _fetch_month_record(m_str: str) -> Dict[str, Any]:
                 m = pd.to_datetime(m_str)
-                # Slice mid-month chunk (1 chunk of 12 steps, time slice across 00:00 to 05:30)
+                # Slice representative mid-month chunk (1 Zarr chunk = 12 half-hourly steps, 00:00 to 05:30)
+                # This aligns with MPC Zarr chunk boundaries to ensure 72 months complete within serverless timeout.
                 slice_start = f"{m.year}-{m.month:02d}-15 00:00"
                 slice_end = f"{m.year}-{m.month:02d}-15 05:30"
                 days_in_m = calendar.monthrange(m.year, m.month)[1]

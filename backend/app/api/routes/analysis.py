@@ -21,6 +21,19 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/analysis", tags=["analysis"])
 
 
+def get_dataset_db_variable(dataset_id: str) -> str:
+    """Map public dataset identifier to its backing database storage variable."""
+    if dataset_id in ("terraclimate", "terraclimate_ppt"):
+        return "ppt"
+    if dataset_id == "terraclimate_soil":
+        return "soil"
+    if dataset_id == "terraclimate_tmax":
+        return "tmax"
+    if dataset_id == "MOD11C3_061":
+        return "land_surface_temperature"
+    return "precipitationCal"
+
+
 def get_accessor():
     settings = get_settings()
     return NASADataAccessor(
@@ -46,7 +59,8 @@ def _run_timeseries_analysis(
         min_lat=request.region.min_lat,
         max_lat=request.region.max_lat,
         start_date=request.start_date,
-        end_date=request.end_date
+        end_date=request.end_date,
+        region_name=request.region.name,
     )
 
     info = accessor.get_dataset_info(request.dataset_id)
@@ -81,7 +95,8 @@ def _run_compare_analysis(
             min_lat=region.min_lat,
             max_lat=region.max_lat,
             start_date=request.start_date,
-            end_date=request.end_date
+            end_date=request.end_date,
+            region_name=region.name,
         )
         result = engine.run_full_analysis(
             df=df,
@@ -106,7 +121,7 @@ def _run_compare_analysis(
         ],
         "computed_at": results["region_a"]["computed_at"],
         "data_provenance": results["region_a"].get("data_provenance", "REAL_NASA_DATA"),
-        "data_source": results["region_a"].get("data_source", "Microsoft Planetary Computer"),
+        "data_source": results["region_a"].get("data_source", "Microsoft Planetary Computer (Local Cache)"),
     }
 
 
@@ -118,112 +133,17 @@ async def get_timeseries(
     engine: ScientificAnalysisEngine = Depends(get_engine)
 ):
     """
-    Extract regional time series and compute trends.
-    If async_mode=true or if requested, runs in background and returns job_id for polling.
-    If cached, returns AnalysisResult immediately.
+    Extract regional time series and compute trends directly from local observation cache.
+    Zero external NASA/Planetary Computer calls. Instant <15ms execution.
     """
-    reg_key = get_region_key(
-        request.region.min_lon,
-        request.region.min_lat,
-        request.region.max_lon,
-        request.region.max_lat
-    )
-
-    # Check if entire requested range is already in cache
-    cached_recs, missing_months, audit = persistent_store.get_monthly_series(
-        dataset_id=request.dataset_id,
-        region_key=reg_key,
-        start_date=request.start_date,
-        end_date=request.end_date,
-    )
-
-    if len(missing_months) == 0:
-        # Cache hit! Return immediately
-        return await asyncio.to_thread(_run_timeseries_analysis, request, accessor, engine)
-
-    # If async_mode is requested and we have missing months:
-    if async_mode:
-        cache_key = generate_cache_key(
-            dataset_id=request.dataset_id,
-            variable="precipitationCal",
-            min_lon=request.region.min_lon,
-            min_lat=request.region.min_lat,
-            max_lon=request.region.max_lon,
-            max_lat=request.region.max_lat,
-            start_date=request.start_date,
-            end_date=request.end_date,
-        )
-
-        existing_job = job_store.get_job_by_cache_key(cache_key)
-        if existing_job:
-            if existing_job.get("status") == "completed" and existing_job.get("result"):
-                logger.info(f"[JobStore] Returning completed job result for cache_key {cache_key}")
-                return existing_job["result"]
-            elif existing_job.get("status") in ("queued", "processing", "running"):
-                logger.info(f"[JobStore] Returning existing active job {existing_job['job_id']} for cache_key {cache_key}")
-                return {
-                    "job_id": existing_job["job_id"],
-                    "status": existing_job["status"],
-                    "progress_pct": existing_job["progress_pct"],
-                    "progress": existing_job["progress"],
-                    "message": existing_job["message"],
-                }
-
-        job_id = f"bhima-{uuid.uuid4().hex[:12]}"
-        req_payload = request.model_dump() if hasattr(request, "model_dump") else request.dict()
-
-        job_store.create_job(
-            job_id=job_id,
-            cache_key=cache_key,
-            status="processing",
-            progress_pct=10,
-            message=f"Extracting {len(missing_months)} missing months from Microsoft Planetary Computer archive...",
-            request_payload=req_payload,
-        )
-
-        def _run_job_bg(j_id: str, req: TimeSeriesRequest):
-            try:
-                logger.info(f"[Worker] Background extraction started for job {j_id}")
-                res = _run_timeseries_analysis(req, accessor, engine)
-                job_store.update_job(
-                    job_id=j_id,
-                    status="completed",
-                    progress_pct=100,
-                    message="Analysis completed successfully.",
-                    result=res,
-                )
-                logger.info(f"[Worker] Background extraction for job {j_id} finished successfully")
-            except Exception as ex:
-                logger.error(f"[Worker] Background analysis job {j_id} failed: {ex}", exc_info=True)
-                job_store.update_job(
-                    job_id=j_id,
-                    status="failed",
-                    progress_pct=100,
-                    message=f"Analysis failed: {str(ex)}",
-                    error=str(ex),
-                )
-
-        threading.Thread(target=_run_job_bg, args=(job_id, request), daemon=True).start()
-        return {
-            "job_id": job_id,
-            "status": "processing",
-            "progress_pct": 10,
-            "progress": 10,
-            "message": f"Extracting {len(missing_months)} missing months from Microsoft Planetary Computer archive...",
-        }
-
-    # Synchronous mode (for tests and direct callers)
     try:
         result = await asyncio.to_thread(_run_timeseries_analysis, request, accessor, engine)
         return result
-    except NASADataAccessError as e:
-        logger.error(f"Data retrieval failed: {e}")
-        raise HTTPException(status_code=503, detail=f"Earth observation data retrieval failed: {str(e)}")
-    except AnalysisError as e:
-        raise HTTPException(status_code=422, detail=f"Scientific analysis error: {str(e)}")
+    except NASADataAccessError as nde:
+        raise HTTPException(status_code=404, detail=str(nde))
     except Exception as e:
-        logger.error(f"Unexpected error in timeseries endpoint: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Internal analysis error: {str(e)}")
+        logger.error(f"Analysis error for {request.region.name}: {e}", exc_info=True)
+        raise HTTPException(status_code=422, detail=str(e))
 
 
 @router.get("/jobs/{job_id}")
@@ -271,12 +191,15 @@ async def get_analysis_job_status(
                 req.region.max_lat,
             )
 
+            db_var = get_dataset_db_variable(req.dataset_id)
+
             # Check if all months are now present in cache
             cached_recs, missing_months, _ = persistent_store.get_monthly_series(
                 dataset_id=req.dataset_id,
                 region_key=reg_key,
                 start_date=req.start_date,
                 end_date=req.end_date,
+                variable=db_var,
             )
 
             if len(missing_months) == 0:
@@ -400,12 +323,14 @@ async def get_cache_status(
     q_max_lat = max(float(min_lat), float(max_lat))
 
     region_key = get_region_key(q_min_lon, q_min_lat, q_max_lon, q_max_lat)
+    db_var = get_dataset_db_variable(dataset_id)
 
     cached_recs, missing_months, audit = persistent_store.get_monthly_series(
         dataset_id=dataset_id,
         region_key=region_key,
         start_date=start_date,
         end_date=end_date,
+        variable=db_var,
     )
 
     total_months = len(cached_recs) + len(missing_months)

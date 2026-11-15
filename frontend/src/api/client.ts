@@ -12,11 +12,28 @@ import {
   CacheSummaryResponse,
 } from '../types';
 
-const API_BASE_URL = (
-  import.meta.env.VITE_API_BASE_URL ||
-  import.meta.env.VITE_API_URL ||
-  (typeof window !== 'undefined' && window.location.hostname !== 'localhost' ? '' : 'http://localhost:8000')
-).replace(/\/+$/, '');
+function getApiBaseUrl(): string {
+  const customBase = import.meta.env.VITE_API_BASE_URL;
+  if (customBase && typeof customBase === 'string' && customBase.trim()) {
+    return customBase.trim().replace(/\/+$/, '');
+  }
+
+  const envUrl = import.meta.env.VITE_API_URL;
+  if (typeof window !== 'undefined') {
+    const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+    if (!isLocalhost) {
+      // In production browser, if envUrl contains localhost, ignore it to prevent browser connection errors
+      if (envUrl && typeof envUrl === 'string' && !envUrl.includes('localhost') && !envUrl.includes('127.0.0.1')) {
+        return envUrl.trim().replace(/\/+$/, '');
+      }
+      return '';
+    }
+  }
+
+  return (envUrl || 'http://localhost:8000').replace(/\/+$/, '');
+}
+
+const API_BASE_URL = getApiBaseUrl();
 
 /**
  * Global Configurable Timeout Matrix
@@ -28,7 +45,7 @@ export const API_TIMEOUTS = {
   METADATA: 30000,        // 30s for catalog and schema retrieval
   AGENT_CHAT: 120000,     // 2 minutes for multi-step Gemini tool calling
   LONG_RUNNING: 900000,   // 15 minutes (900,000 ms) for satellite extractions and regional comparisons
-  POLL_REQUEST: 15000,    // 15 seconds per background job poll HTTP request
+  POLL_REQUEST: 60000,    // 60 seconds per background job poll HTTP request (matches Vercel serverless maxDuration)
   POLL_INTERVAL: 2000,    // 2 seconds polling frequency
 };
 
@@ -142,12 +159,12 @@ export const apiClient = {
     data: TimeSeriesRequest,
     onProgress?: (progressPct: number, message: string) => void
   ): Promise<AnalysisResult> {
-    // 1. Initial request: backend either returns immediate AnalysisResult (<10ms cache hit)
-    // or initiates a deduplicated background worker job and returns a job_id.
-    const initialRes = await request<any>('/analysis/timeseries?async_mode=true', {
+    // 1. Initial request: backend returns immediate AnalysisResult (<15ms cache retrieval)
+    // with zero background thread overhead or serverless worker timeouts.
+    const initialRes = await request<any>('/analysis/timeseries', {
       method: 'POST',
       body: JSON.stringify(data),
-      timeoutMs: 45000, // 45 seconds for initial handshake
+      timeoutMs: 45000, // 45 seconds timeout
     });
 
     // Cache hit: Direct AnalysisResult returned

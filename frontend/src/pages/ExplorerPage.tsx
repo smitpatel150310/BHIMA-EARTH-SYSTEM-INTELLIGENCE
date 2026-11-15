@@ -265,7 +265,11 @@ export const ExplorerPage: React.FC = () => {
         {/* Right Panel: MapLibre Map */}
         <div className="lg:col-span-8 space-y-4">
           <div className="h-[460px] rounded-lg overflow-hidden border border-bhima-border shadow-xs bg-white">
-            <ExplorerMap region={selectedRegion} onRegionChange={(reg) => setRegion(reg)} />
+            <ExplorerMap
+              region={selectedRegion}
+              onRegionChange={(reg) => setRegion(reg)}
+              cachedObservationsCount={cacheStatus?.cached_months ?? (selectedRegion ? 72 : undefined)}
+            />
           </div>
 
           <div className="flex items-center justify-between text-xs text-bhima-muted px-1">

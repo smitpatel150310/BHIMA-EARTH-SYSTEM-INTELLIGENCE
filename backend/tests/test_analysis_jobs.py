@@ -115,3 +115,106 @@ def test_api_jobs_nonexistent_returns_404():
     resp = client.get("/analysis/jobs/nonexistent-job-9999")
     assert resp.status_code == 404
     assert "not found" in resp.json()["detail"].lower()
+
+
+def test_julian_calendar_decoding_and_slicing():
+    """
+    Regression test for:
+    'Failed to decode variable time: unable to decode time units minutes since 2000-06-01 00:00:00 with calendar julian'
+    Verifies that cftime correctly decodes Julian calendar time coordinates and enables xarray time slicing.
+    """
+    import cftime
+    import xarray as xr
+    import numpy as np
+
+    units = "minutes since 2000-06-01 00:00:00"
+    calendar_name = "julian"
+
+    # Half-hourly steps for 2 days (48 steps/day = 96 steps)
+    minute_offsets = np.arange(0, 96 * 30, 30, dtype=np.int64)
+    decoded_times = cftime.num2date(minute_offsets, units=units, calendar=calendar_name)
+
+    assert len(decoded_times) == 96
+    assert isinstance(decoded_times[0], cftime.DatetimeJulian)
+    assert decoded_times[0].year == 2000
+    assert decoded_times[0].month == 6
+    assert decoded_times[0].day == 1
+    assert decoded_times[0].hour == 0
+    assert decoded_times[0].minute == 0
+
+    # Build xarray dataset with DatetimeJulian coordinate
+    ds = xr.Dataset(
+        {"precipitationCal": (["time", "lat", "lon"], np.random.uniform(0, 10, size=(96, 2, 2)))},
+        coords={
+            "time": decoded_times,
+            "lat": [20.0, 20.1],
+            "lon": [70.0, 70.1],
+        },
+    )
+
+    # Test time string slicing on cftime.DatetimeJulian
+    sub = ds.sel(time=slice("2000-06-01 00:00", "2000-06-01 05:30"))
+    assert len(sub.time) == 12  # 12 half-hourly steps in 6 hours
+    assert sub["precipitationCal"].mean() >= 0.0
+
+    # Test decode_times=False fallback simulation
+    ds_raw = xr.Dataset(
+        {"precipitationCal": (["time"], np.arange(10, dtype=float))},
+        coords={"time": np.arange(0, 300, 30, dtype=np.int64)},
+    )
+    ds_raw.time.attrs["units"] = units
+    ds_raw.time.attrs["calendar"] = calendar_name
+
+    # Decode via fallback path
+    fallback_decoded = cftime.num2date(
+        ds_raw.time.values,
+        units=ds_raw.time.attrs["units"],
+        calendar=ds_raw.time.attrs["calendar"],
+    )
+    ds_raw["time"] = ("time", fallback_decoded, ds_raw.time.attrs)
+    assert isinstance(ds_raw.time.values[0], cftime.DatetimeJulian)
+    assert str(ds_raw.time.values[0]) == "2000-06-01 00:00:00"
+
+
+def test_sanitize_postgres_url():
+    """Verify that credentials and tokens are always masked in diagnostic logging."""
+    from app.core.db_engine import sanitize_postgres_url
+
+    raw_url = "postgresql://neondb_owner:npg_SecretPass123!@ep-cool-fog-123456.us-east-2.aws.neon.tech:5432/neondb?sslmode=require"
+    sanitized = sanitize_postgres_url(raw_url)
+
+    assert "npg_SecretPass123!" not in sanitized
+    assert "****" in sanitized
+    assert "neondb_owner" in sanitized
+    assert "ep-cool-fog-123456.us-east-2.aws.neon.tech" in sanitized
+    assert "neondb" in sanitized
+
+    # Empty / none check
+    assert sanitize_postgres_url(None) == "<none>"
+    assert sanitize_postgres_url("") == "<none>"
+
+
+def test_neon_env_detection(monkeypatch):
+    """Verify that get_postgres_url reads Neon and Vercel variables in priority order."""
+    from app.core.db_engine import get_postgres_url
+
+    # Clean existing
+    for k in ["NEON_DATABASE_URL", "DATABASE_URL", "POSTGRES_URL", "POSTGRES_HOST", "POSTGRES_USER", "POSTGRES_PASSWORD"]:
+        monkeypatch.delenv(k, raising=False)
+
+    assert get_postgres_url() is None
+
+    # NEON_DATABASE_URL
+    monkeypatch.setenv("NEON_DATABASE_URL", "postgresql://user:pass@neon.tech/db")
+    assert get_postgres_url() == "postgresql://user:pass@neon.tech/db"
+
+    # DATABASE_URL override
+    monkeypatch.delenv("NEON_DATABASE_URL")
+    monkeypatch.setenv("DATABASE_URL", "postgres://user:pass@neon-pooler.tech/db?sslmode=require")
+    assert get_postgres_url() == "postgres://user:pass@neon-pooler.tech/db?sslmode=require"
+
+    # POSTGRES_URL override
+    monkeypatch.delenv("DATABASE_URL")
+    monkeypatch.setenv("POSTGRES_URL", "postgres://user:pass@vercel.tech/db")
+    assert get_postgres_url() == "postgres://user:pass@vercel.tech/db"
+

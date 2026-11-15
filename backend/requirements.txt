@@ -15,9 +15,11 @@ google-generativeai==0.7.2
 cachetools==5.3.3
 python-multipart==0.0.9
 pg8000==1.31.2
+psycopg2-binary==2.9.9
 pystac-client==0.9.1
 planetary-computer==1.0.0
 adlfs==2026.8.0
 xarray==2024.3.0
 zarr==2.18.7
 fsspec==2026.9.0
+cftime==1.6.6.1

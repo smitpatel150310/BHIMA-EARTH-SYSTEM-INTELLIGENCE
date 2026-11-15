@@ -58,6 +58,20 @@ export const REGION_PRESETS: Record<string, RegionRequest> = {
     min_lat: 32.0,
     max_lat: 48.0,
   },
+  'Central Gujarat (Vadodara)': {
+    name: 'Central Gujarat (Vadodara)',
+    min_lon: 73.1,
+    max_lon: 73.3,
+    min_lat: 22.1,
+    max_lat: 22.5,
+  },
+  'Rajasthan, India': {
+    name: 'Rajasthan, India',
+    min_lon: 69.5,
+    max_lon: 78.0,
+    min_lat: 23.0,
+    max_lat: 30.0,
+  },
 };
 
 export interface RecentInvestigation {

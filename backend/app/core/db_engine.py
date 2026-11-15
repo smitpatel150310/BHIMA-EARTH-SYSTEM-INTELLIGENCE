@@ -633,16 +633,89 @@ class SQLiteEngine(BaseDatabaseEngine):
             conn.close()
 
 
+def sanitize_postgres_url(url: Optional[str]) -> str:
+    """Mask credentials in PostgreSQL URL for secure diagnostic logging."""
+    if not url:
+        return "<none>"
+    import urllib.parse
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.password:
+            netloc = f"{parsed.username}:****@{parsed.hostname}"
+            if parsed.port:
+                netloc += f":{parsed.port}"
+            return urllib.parse.urlunparse((
+                parsed.scheme,
+                netloc,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment,
+            ))
+        elif parsed.hostname:
+            return f"{parsed.scheme}://{parsed.hostname}:{parsed.port or 5432}{parsed.path}"
+    except Exception:
+        pass
+    return "postgresql://***:***@***"
+
+
+def get_postgres_url() -> Optional[str]:
+    """
+    Detect configured PostgreSQL / Neon database connection URL from environment.
+    Checks all standard Neon and Vercel environment variable aliases in priority order:
+    1. Direct Neon URL aliases: NEON_DATABASE_URL, DATABASE_URL, DATABASE_POSTGRES_URL, POSTGRES_URL, etc.
+    2. Unpooled Neon URL aliases: DATABASE_PG_T_UNPOOLED, DATABASE_URL_UNPOOLED, POSTGRES_URL_NON_POOLING.
+    3. Discrete components: POSTGRES_USER / DATABASE_PGUSER, POSTGRES_PASSWORD / DATABASE_PGPASSWORD, etc.
+    """
+    env_keys = [
+        "NEON_DATABASE_URL",
+        "DATABASE_URL",
+        "DATABASE_POSTGRES_URL",
+        "POSTGRES_URL",
+        "POSTGRES_PRISMA_URL",
+        "DATABASE_PG_T_UNPOOLED",
+        "DATABASE_URL_UNPOOLED",
+        "POSTGRES_URL_NON_POOLING",
+        "BHIMA_POSTGRES_URL",
+    ]
+    for key in env_keys:
+        val = os.environ.get(key)
+        if val and (val.startswith("postgres://") or val.startswith("postgresql://")):
+            logger.info(f"[Storage] Detected database connection string via environment variable '{key}'")
+            return val
+
+    # Support discrete Neon / Postgres variables
+    host = (
+        os.environ.get("POSTGRES_HOST")
+        or os.environ.get("DATABASE_PGHOST")
+        or os.environ.get("DATABASE_NE_H_BASE_URL")
+    )
+    user = os.environ.get("POSTGRES_USER") or os.environ.get("DATABASE_PGUSER")
+    password = os.environ.get("POSTGRES_PASSWORD") or os.environ.get("DATABASE_PGPASSWORD")
+    db = os.environ.get("POSTGRES_DATABASE") or os.environ.get("DATABASE_PGDATABASE") or "neondb"
+    port = os.environ.get("POSTGRES_PORT") or os.environ.get("DATABASE_PGPORT") or "5432"
+
+    if host and user and password:
+        import urllib.parse
+        encoded_user = urllib.parse.quote_plus(user)
+        encoded_pwd = urllib.parse.quote_plus(password)
+        logger.info("[Storage] Detected database connection via discrete POSTGRES_* / DATABASE_PG* environment variables")
+        return f"postgresql://{encoded_user}:{encoded_pwd}@{host}:{port}/{db}?sslmode=require"
+
+    return None
+
+
 class PostgreSQLEngine(BaseDatabaseEngine):
     """
-    Managed PostgreSQL database engine (Vercel Postgres, Neon, Supabase, AWS RDS).
-    Guarantees cross-instance persistent writes and read replication across Vercel Functions.
+    Managed PostgreSQL database engine (Neon, Vercel Postgres, AWS RDS).
+    Guarantees cross-instance persistent writes, PgBouncer pooler compatibility,
+    SSL encryption, and strict isolation from ephemeral serverless filesystems.
     """
 
     def __init__(self, connection_url: str):
         self.connection_url = connection_url
         self._driver = self._determine_driver()
-        logger.info(f"PostgreSQLEngine initialized using driver '{self._driver}'")
+        logger.info(f"[Storage] Initializing PostgreSQLEngine using driver '{self._driver}'")
         self.init_schema()
 
     def _determine_driver(self) -> str:
@@ -654,34 +727,60 @@ class PostgreSQLEngine(BaseDatabaseEngine):
                 import pg8000
                 return "pg8000"
             except ImportError:
-                raise ImportError("PostgreSQL engine requires psycopg2-binary or pg8000. Install via pip install psycopg2-binary pg8000")
+                raise ImportError(
+                    "PostgreSQL engine requires psycopg2-binary or pg8000. "
+                    "Install via pip install psycopg2-binary pg8000"
+                )
 
     def _get_connection(self):
-        # Normalize connection url
+        """
+        Establish an authenticated, SSL-encrypted connection to Neon PostgreSQL.
+        Tries psycopg2 first; falls back seamlessly to pg8000 DB-API.
+        """
         url = self.connection_url
         if url.startswith("postgres://"):
             url = url.replace("postgres://", "postgresql://", 1)
 
+        # 1. Try psycopg2 if selected
         if self._driver == "psycopg2":
-            import psycopg2
-            import psycopg2.extras
-            conn = psycopg2.connect(url, connect_timeout=10)
-            return conn
-        else:
-            import pg8000.native
-            # Parse url for pg8000
-            import urllib.parse
-            parsed = urllib.parse.urlparse(url)
-            conn = pg8000.native.Connection(
-                user=parsed.username,
-                password=parsed.password,
-                host=parsed.hostname,
-                port=parsed.port or 5432,
-                database=parsed.path.lstrip("/"),
-                ssl_context=True,
-                timeout=10,
-            )
-            return conn
+            try:
+                import psycopg2
+                conn = psycopg2.connect(url, connect_timeout=10)
+                # Keep autocommit=False so explicit conn.commit() calls work correctly.
+                # psycopg2 raises ProgrammingError if commit() is called with autocommit=True.
+                conn.autocommit = False
+                return conn
+            except Exception as e:
+                logger.warning(f"[Storage] psycopg2 connection failed: {e}. Trying pg8000 fallback...")
+
+        # 2. pg8000 PEP 249 standard DB-API fallback
+        import pg8000
+        import urllib.parse
+        import ssl
+
+        parsed = urllib.parse.urlparse(url)
+        user = urllib.parse.unquote(parsed.username) if parsed.username else ""
+        password = urllib.parse.unquote(parsed.password) if parsed.password else ""
+        host = parsed.hostname
+        port = parsed.port or 5432
+        db_name = parsed.path.lstrip("/").split("?")[0] or "neondb"
+
+        ssl_ctx = ssl.create_default_context()
+        # Neon uses Let's Encrypt certificates; disable hostname check for pooler proxies
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+
+        conn = pg8000.connect(
+            user=user,
+            password=password,
+            host=host,
+            port=port,
+            database=db_name,
+            ssl_context=ssl_ctx,
+            timeout=10,
+        )
+        conn.autocommit = True  # pg8000: autocommit avoids explicit BEGIN/COMMIT requirements
+        return conn
 
     def init_schema(self):
         conn = self._get_connection()
@@ -754,9 +853,6 @@ class PostgreSQLEngine(BaseDatabaseEngine):
                 created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
             );
 
-            CREATE INDEX IF NOT EXISTS idx_pg_monthly_lookup ON regional_monthly (dataset_id, region_key, date, variable);
-            CREATE INDEX IF NOT EXISTS idx_pg_annual_lookup ON regional_annual (dataset_id, region_key, year, variable);
-
             CREATE TABLE IF NOT EXISTS analysis_jobs (
                 job_id VARCHAR(64) PRIMARY KEY,
                 cache_key VARCHAR(128),
@@ -770,21 +866,36 @@ class PostgreSQLEngine(BaseDatabaseEngine):
                 updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
             );
 
+            CREATE INDEX IF NOT EXISTS idx_pg_monthly_lookup ON regional_monthly (dataset_id, region_key, date, variable);
+            CREATE INDEX IF NOT EXISTS idx_pg_annual_lookup ON regional_annual (dataset_id, region_key, year, variable);
             CREATE INDEX IF NOT EXISTS idx_pg_jobs_cache_key ON analysis_jobs (cache_key);
             CREATE INDEX IF NOT EXISTS idx_pg_jobs_status ON analysis_jobs (status);
+            CREATE INDEX IF NOT EXISTS idx_pg_jobs_created_at ON analysis_jobs (created_at);
             """
-            if self._driver == "psycopg2":
-                with conn.cursor() as cur:
-                    cur.execute(ddl)
-                conn.commit()
-            else:
+            cur = conn.cursor()
+            try:
                 for statement in ddl.split(";"):
-                    s = statement.strip()
-                    if s:
-                        conn.run(s)
-            logger.info("PostgreSQL observation tables verified successfully.")
+                    stmt = statement.strip()
+                    if stmt:
+                        cur.execute(stmt)
+                # For psycopg2 (autocommit=False) we must commit explicitly.
+                # For pg8000 (autocommit=True) commit() is a no-op / not needed.
+                try:
+                    conn.commit()
+                except Exception:
+                    pass  # pg8000 autocommit=True raises no error but commit is ignored
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+            finally:
+                cur.close()
+            logger.info("[Storage] PostgreSQL observation tables and indices verified successfully.")
         except Exception as e:
-            logger.error(f"PostgreSQL schema initialization error: {e}")
+            logger.error(f"[Storage] PostgreSQL schema initialization error: {e}")
+            raise
         finally:
             conn.close()
 
@@ -812,22 +923,13 @@ class PostgreSQLEngine(BaseDatabaseEngine):
               AND variable = %s
             ORDER BY date ASC, aggregation_method ASC
             """
-            rows = []
-            if self._driver == "psycopg2":
-                import psycopg2.extras
-                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                    cur.execute(sql, (dataset_id, region_key, all_month_strs[0], all_month_strs[-1], variable))
-                    rows = [dict(r) for r in cur.fetchall()]
-            else:
-                # pg8000
-                cols = [
-                    "dataset_id", "region_key", "date", "variable", "aggregation_method",
-                    "processing_version", "value", "units", "valid_pixels", "coverage_fraction",
-                    "n_observations", "n_missing", "fetch_time_ms", "downloaded_bytes",
-                    "data_provenance", "data_source"
-                ]
-                res = conn.run(sql, dataset_id, region_key, all_month_strs[0], all_month_strs[-1], variable)
-                rows = [dict(zip(cols, r)) for r in res]
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, (dataset_id, region_key, all_month_strs[0], all_month_strs[-1], variable))
+                cols = [d[0] for d in cur.description]
+                rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+            finally:
+                cur.close()
 
             cached_map = {}
             for r in rows:
@@ -916,15 +1018,24 @@ class PostgreSQLEngine(BaseDatabaseEngine):
                 )
                 for r in records
             ]
-            if self._driver == "psycopg2":
-                import psycopg2.extras
-                with conn.cursor() as cur:
+            cur = conn.cursor()
+            try:
+                if self._driver == "psycopg2":
+                    import psycopg2.extras
                     psycopg2.extras.execute_batch(cur, sql, params_list)
+                else:
+                    for p in params_list:
+                        cur.execute(sql, p)
                 conn.commit()
-            else:
-                for p in params_list:
-                    conn.run(sql, *p)
-            logger.info(f"Persisted {len(records)} observations into PostgreSQL ({dataset_id} | {region_key})")
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+            finally:
+                cur.close()
+            logger.info(f"[Storage] Persisted {len(records)} observations into PostgreSQL ({dataset_id} | {region_key})")
         finally:
             conn.close()
 
@@ -975,37 +1086,47 @@ class PostgreSQLEngine(BaseDatabaseEngine):
                 )
                 for a in annual_records
             ]
-            if self._driver == "psycopg2":
-                import psycopg2.extras
-                with conn.cursor() as cur:
+            cur = conn.cursor()
+            try:
+                if self._driver == "psycopg2":
+                    import psycopg2.extras
                     psycopg2.extras.execute_batch(cur, sql, params_list)
+                else:
+                    for p in params_list:
+                        cur.execute(sql, p)
                 conn.commit()
-            else:
-                for p in params_list:
-                    conn.run(sql, *p)
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+            finally:
+                cur.close()
         finally:
             conn.close()
 
     def get_storage_stats(self) -> Dict[str, Any]:
         conn = self._get_connection()
         try:
-            if self._driver == "psycopg2":
-                with conn.cursor() as cur:
-                    cur.execute("SELECT count(*) FROM regional_monthly")
-                    m_count = cur.fetchone()[0]
-                    cur.execute("SELECT count(*) FROM regional_annual")
-                    a_count = cur.fetchone()[0]
-                    cur.execute("SELECT count(*) FROM regional_daily")
-                    d_count = cur.fetchone()[0]
-            else:
-                m_count = conn.run("SELECT count(*) FROM regional_monthly")[0][0]
-                a_count = conn.run("SELECT count(*) FROM regional_annual")[0][0]
-                d_count = conn.run("SELECT count(*) FROM regional_daily")[0][0]
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT count(*) FROM regional_monthly")
+                m_count = cur.fetchone()[0]
+                cur.execute("SELECT count(*) FROM regional_annual")
+                a_count = cur.fetchone()[0]
+                cur.execute("SELECT count(*) FROM regional_daily")
+                d_count = cur.fetchone()[0]
+                cur.execute("SELECT count(*) FROM analysis_jobs")
+                j_count = cur.fetchone()[0]
+            finally:
+                cur.close()
             return {
                 "engine": "postgresql",
                 "cached_monthly_records": m_count,
                 "cached_annual_records": a_count,
                 "cached_daily_records": d_count,
+                "cached_jobs_records": j_count,
                 "processing_version": PROCESSING_VERSION,
             }
         finally:
@@ -1025,36 +1146,26 @@ class PostgreSQLEngine(BaseDatabaseEngine):
             ORDER BY dataset_id, region_key
             """
             entries = []
-            if self._driver == "psycopg2":
-                import psycopg2.extras
-                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                    cur.execute(sql)
-                    for r in cur.fetchall():
-                        entries.append({
-                            "dataset_id": r["dataset_id"],
-                            "region_key": r["region_key"],
-                            "variable": r["variable"],
-                            "cached_months": int(r["cached_months"]),
-                            "target_period": "2015-01 to 2020-12 (72 months)",
-                            "is_72_complete": int(r["cached_months"]) >= 72,
-                            "min_date": r["min_date"],
-                            "max_date": r["max_date"],
-                            "last_updated": str(r["last_updated"]),
-                        })
-            else:
-                res = conn.run(sql)
-                for r in res:
+            cur = conn.cursor()
+            try:
+                cur.execute(sql)
+                cols = [d[0] for d in cur.description]
+                for r in cur.fetchall():
+                    row = dict(zip(cols, r))
                     entries.append({
-                        "dataset_id": r[0],
-                        "region_key": r[1],
-                        "variable": r[2],
-                        "cached_months": int(r[3]),
+                        "dataset_id": row["dataset_id"],
+                        "region_key": row["region_key"],
+                        "variable": row["variable"],
+                        "cached_months": int(row["cached_months"]),
                         "target_period": "2015-01 to 2020-12 (72 months)",
-                        "is_72_complete": int(r[3]) >= 72,
-                        "min_date": r[4],
-                        "max_date": r[5],
-                        "last_updated": str(r[6]),
+                        "is_72_complete": int(row["cached_months"]) >= 72,
+                        "min_date": row["min_date"],
+                        "max_date": row["max_date"],
+                        "last_updated": str(row["last_updated"]),
                     })
+            finally:
+                cur.close()
+
             stats = self.get_storage_stats()
             return {
                 "status": "ok",
@@ -1094,12 +1205,19 @@ class PostgreSQLEngine(BaseDatabaseEngine):
                 request_payload = EXCLUDED.request_payload,
                 updated_at = CURRENT_TIMESTAMP
             """
-            if self._driver == "psycopg2":
-                with conn.cursor() as cur:
-                    cur.execute(sql, (job_id, cache_key, status, progress_pct, message, payload_str))
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, (job_id, cache_key, status, progress_pct, message, payload_str))
                 conn.commit()
-            else:
-                conn.run(sql, job_id, cache_key, status, progress_pct, message, payload_str)
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+            finally:
+                cur.close()
+
             return {
                 "job_id": job_id,
                 "cache_key": cache_key,
@@ -1139,12 +1257,19 @@ class PostgreSQLEngine(BaseDatabaseEngine):
                 updated_at = CURRENT_TIMESTAMP
             WHERE job_id = %s
             """
-            if self._driver == "psycopg2":
-                with conn.cursor() as cur:
-                    cur.execute(sql, (status, progress_pct, message, res_str, error, job_id))
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, (status, progress_pct, message, res_str, error, job_id))
                 conn.commit()
-            else:
-                conn.run(sql, status, progress_pct, message, res_str, error, job_id)
+            except Exception:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                raise
+            finally:
+                cur.close()
+
             return self.get_job(job_id)
         finally:
             conn.close()
@@ -1160,21 +1285,15 @@ class PostgreSQLEngine(BaseDatabaseEngine):
             WHERE job_id = %s
             """
             row = None
-            if self._driver == "psycopg2":
-                import psycopg2.extras
-                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                    cur.execute(sql, (job_id,))
-                    res = cur.fetchone()
-                    if res:
-                        row = dict(res)
-            else:
-                cols = [
-                    "job_id", "cache_key", "status", "progress_pct", "message",
-                    "request_payload", "result", "error", "created_at", "updated_at"
-                ]
-                res = conn.run(sql, job_id)
-                if res:
-                    row = dict(zip(cols, res[0]))
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, (job_id,))
+                r = cur.fetchone()
+                if r:
+                    cols = [d[0] for d in cur.description]
+                    row = dict(zip(cols, r))
+            finally:
+                cur.close()
 
             if not row:
                 return None
@@ -1210,21 +1329,15 @@ class PostgreSQLEngine(BaseDatabaseEngine):
             ORDER BY created_at DESC LIMIT 1
             """
             row = None
-            if self._driver == "psycopg2":
-                import psycopg2.extras
-                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                    cur.execute(sql, (cache_key,))
-                    res = cur.fetchone()
-                    if res:
-                        row = dict(res)
-            else:
-                cols = [
-                    "job_id", "cache_key", "status", "progress_pct", "message",
-                    "request_payload", "result", "error", "created_at", "updated_at"
-                ]
-                res = conn.run(sql, cache_key)
-                if res:
-                    row = dict(zip(cols, res[0]))
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, (cache_key,))
+                r = cur.fetchone()
+                if r:
+                    cols = [d[0] for d in cur.description]
+                    row = dict(zip(cols, r))
+            finally:
+                cur.close()
 
             if not row:
                 return None
@@ -1252,34 +1365,45 @@ class PostgreSQLEngine(BaseDatabaseEngine):
         conn = self._get_connection()
         try:
             sql = f"DELETE FROM analysis_jobs WHERE created_at < CURRENT_TIMESTAMP - INTERVAL '{int(max_age_seconds)} seconds'"
-            if self._driver == "psycopg2":
-                with conn.cursor() as cur:
-                    cur.execute(sql)
+            cur = conn.cursor()
+            try:
+                cur.execute(sql)
                 conn.commit()
-            else:
-                conn.run(sql)
+            finally:
+                cur.close()
         except Exception as e:
-            logger.warning(f"Error cleaning expired PostgreSQL jobs: {e}")
+            logger.warning(f"[Storage] Error cleaning expired PostgreSQL jobs: {e}")
         finally:
             conn.close()
-
 
 
 def create_database_engine(db_path: str, parquet_dir: str) -> BaseDatabaseEngine:
     """
     Factory to instantiate the appropriate database engine.
-    If DATABASE_URL or POSTGRES_URL is set, switches to PostgreSQLEngine for permanent cloud persistence.
+    If PostgreSQL / Neon is configured via environment variables, initializes PostgreSQLEngine.
+    Guarantees that production environments do not silently fall back to ephemeral /tmp SQLite storage.
     Otherwise, defaults to SQLiteEngine for zero-configuration local development.
     """
-    pg_url = (
-        os.environ.get("POSTGRES_URL")
-        or os.environ.get("DATABASE_URL")
-        or os.environ.get("BHIMA_POSTGRES_URL")
-    )
+    pg_url = get_postgres_url()
     if pg_url:
+        sanitized = sanitize_postgres_url(pg_url)
+        logger.info(f"[Storage] Connecting to PostgreSQL / Neon at {sanitized}...")
         try:
-            return PostgreSQLEngine(connection_url=pg_url)
+            engine = PostgreSQLEngine(connection_url=pg_url)
+            logger.info("[Storage] PostgreSQL / Neon connection established and verified successfully.")
+            return engine
         except Exception as e:
-            logger.warning(f"Could not connect to PostgreSQL ({e}). Falling back to SQLite.")
+            logger.critical(
+                f"[Storage] CRITICAL: Failed to connect to PostgreSQL / Neon at {sanitized}: {e}"
+            )
+            is_prod = bool(os.environ.get("VERCEL") or os.environ.get("ENVIRONMENT") == "production")
+            if is_prod:
+                raise RuntimeError(
+                    f"Production PostgreSQL / Neon connection failed to {sanitized}: {e}. "
+                    "Ensure Neon credentials, network access, and SSL settings are valid."
+                ) from e
+            else:
+                logger.warning(f"[Storage] Development fallback: Falling back to local SQLite ({e})")
 
+    logger.info("[Storage] Initializing local SQLite database engine.")
     return SQLiteEngine(db_path=db_path, parquet_dir=parquet_dir)

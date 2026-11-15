@@ -180,14 +180,15 @@ Common bounding boxes for reference:
                 return self.data_accessor.get_dataset_info(dataset_id)
 
             elif tool_name == "extract_regional_timeseries":
-                df, notes, provenance, src = self.data_accessor.get_timeseries_data(
+                df, notes, provenance, src, *extra = self.data_accessor.get_timeseries_data(
                     dataset_id=tool_args["dataset_id"],
                     min_lon=tool_args["min_lon"],
                     max_lon=tool_args["max_lon"],
                     min_lat=tool_args["min_lat"],
                     max_lat=tool_args["max_lat"],
                     start_date=tool_args["start_date"],
-                    end_date=tool_args["end_date"]
+                    end_date=tool_args["end_date"],
+                    region_name=tool_args.get("region_name"),
                 )
                 info = self.data_accessor.get_dataset_info(tool_args["dataset_id"])
                 result = self.analysis_engine.run_full_analysis(
@@ -214,14 +215,15 @@ Common bounding boxes for reference:
             elif tool_name == "compare_regions":
                 results = {}
                 for region_key in ["a", "b"]:
-                    df, notes, provenance, src = self.data_accessor.get_timeseries_data(
+                    df, notes, provenance, src, *extra = self.data_accessor.get_timeseries_data(
                         dataset_id=tool_args["dataset_id"],
                         min_lon=tool_args[f"region_{region_key}_min_lon"],
                         max_lon=tool_args[f"region_{region_key}_max_lon"],
                         min_lat=tool_args[f"region_{region_key}_min_lat"],
                         max_lat=tool_args[f"region_{region_key}_max_lat"],
                         start_date=tool_args["start_date"],
-                        end_date=tool_args["end_date"]
+                        end_date=tool_args["end_date"],
+                        region_name=tool_args.get(f"region_{region_key}_name"),
                     )
                     info = self.data_accessor.get_dataset_info(tool_args["dataset_id"])
                     result = self.analysis_engine.run_full_analysis(

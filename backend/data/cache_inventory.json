@@ -1,0 +1,215 @@
+{
+  "db_path": "C:\\Users\\Dhriti\\Desktop\\NASA\\backend\\data\\bhima_observations.db",
+  "db_size_bytes": 626688,
+  "tables": [
+    "regional_monthly",
+    "regional_daily",
+    "regional_annual",
+    "raw_parquet_index",
+    "stac_collections_meta",
+    "analysis_jobs"
+  ],
+  "monthly_regions": [
+    {
+      "dataset_id": "GPM_3IMERGM_07",
+      "region_key": "-104.00_32.00_-96.00_48.00",
+      "variable": "precipitationCal",
+      "aggregation_method": "SAMPLING_MIDMONTH_CHUNK",
+      "data_provenance": "REAL_NASA_DATA",
+      "record_count": 72,
+      "min_date": "2015-01",
+      "max_date": "2020-12"
+    },
+    {
+      "dataset_id": "GPM_3IMERGM_07",
+      "region_key": "-124.50_32.50_-114.10_42.00",
+      "variable": "precipitationCal",
+      "aggregation_method": "SAMPLING_MIDMONTH_CHUNK",
+      "data_provenance": "REAL_NASA_DATA",
+      "record_count": 72,
+      "min_date": "2015-01",
+      "max_date": "2020-12"
+    },
+    {
+      "dataset_id": "GPM_3IMERGM_07",
+      "region_key": "-15.00_10.00_40.00_20.00",
+      "variable": "precipitationCal",
+      "aggregation_method": "SAMPLING_MIDMONTH_CHUNK",
+      "data_provenance": "REAL_NASA_DATA",
+      "record_count": 72,
+      "min_date": "2015-01",
+      "max_date": "2020-12"
+    },
+    {
+      "dataset_id": "GPM_3IMERGM_07",
+      "region_key": "-5.00_20.00_35.00_30.00",
+      "variable": "precipitationCal",
+      "aggregation_method": "SAMPLING_MIDMONTH_CHUNK",
+      "data_provenance": "REAL_NASA_DATA",
+      "record_count": 72,
+      "min_date": "2015-01",
+      "max_date": "2020-12"
+    },
+    {
+      "dataset_id": "GPM_3IMERGM_07",
+      "region_key": "-73.00_-15.00_-50.00_5.00",
+      "variable": "precipitationCal",
+      "aggregation_method": "SAMPLING_MIDMONTH_CHUNK",
+      "data_provenance": "REAL_NASA_DATA",
+      "record_count": 72,
+      "min_date": "2015-01",
+      "max_date": "2020-12"
+    },
+    {
+      "dataset_id": "GPM_3IMERGM_07",
+      "region_key": "138.00_-37.00_149.00_-24.00",
+      "variable": "precipitationCal",
+      "aggregation_method": "SAMPLING_MIDMONTH_CHUNK",
+      "data_provenance": "REAL_NASA_DATA",
+      "record_count": 72,
+      "min_date": "2015-01",
+      "max_date": "2020-12"
+    },
+    {
+      "dataset_id": "GPM_3IMERGM_07",
+      "region_key": "60.00_10.00_110.00_35.00",
+      "variable": "precipitationCal",
+      "aggregation_method": "SAMPLING_MIDMONTH_CHUNK",
+      "data_provenance": "REAL_NASA_DATA",
+      "record_count": 72,
+      "min_date": "2015-01",
+      "max_date": "2020-12"
+    },
+    {
+      "dataset_id": "GPM_3IMERGM_07",
+      "region_key": "68.10_20.10_74.50_24.70",
+      "variable": "precipitationCal",
+      "aggregation_method": "SAMPLING_MIDMONTH_CHUNK",
+      "data_provenance": "REAL_NASA_DATA",
+      "record_count": 72,
+      "min_date": "2015-01",
+      "max_date": "2020-12"
+    },
+    {
+      "dataset_id": "GPM_3IMERGM_07",
+      "region_key": "73.10_22.10_73.30_22.50",
+      "variable": "precipitationCal",
+      "aggregation_method": "SAMPLING_MIDMONTH_CHUNK",
+      "data_provenance": "REAL_NASA_DATA",
+      "record_count": 72,
+      "min_date": "2015-01",
+      "max_date": "2020-12"
+    },
+    {
+      "dataset_id": "terraclimate",
+      "region_key": "-124.50_32.50_-114.10_42.00",
+      "variable": "ppt",
+      "aggregation_method": "MONTHLY_GRIDDED_MEAN",
+      "data_provenance": "REAL_NASA_DATA",
+      "record_count": 72,
+      "min_date": "2015-01",
+      "max_date": "2020-12"
+    },
+    {
+      "dataset_id": "terraclimate",
+      "region_key": "68.10_20.10_74.50_24.70",
+      "variable": "ppt",
+      "aggregation_method": "MONTHLY_GRIDDED_MEAN",
+      "data_provenance": "REAL_NASA_DATA",
+      "record_count": 72,
+      "min_date": "2015-01",
+      "max_date": "2020-12"
+    },
+    {
+      "dataset_id": "terraclimate_ppt",
+      "region_key": "68.10_20.10_74.50_24.70",
+      "variable": "ppt",
+      "aggregation_method": "MONTHLY_GRIDDED_MEAN",
+      "data_provenance": "REAL_NASA_DATA",
+      "record_count": 72,
+      "min_date": "2015-01",
+      "max_date": "2020-12"
+    },
+    {
+      "dataset_id": "terraclimate_soil",
+      "region_key": "68.10_20.10_74.50_24.70",
+      "variable": "soil",
+      "aggregation_method": "MONTHLY_GRIDDED_MEAN",
+      "data_provenance": "REAL_NASA_DATA",
+      "record_count": 72,
+      "min_date": "2015-01",
+      "max_date": "2020-12"
+    },
+    {
+      "dataset_id": "terraclimate_tmax",
+      "region_key": "68.10_20.10_74.50_24.70",
+      "variable": "tmax",
+      "aggregation_method": "MONTHLY_GRIDDED_MEAN",
+      "data_provenance": "REAL_NASA_DATA",
+      "record_count": 72,
+      "min_date": "2015-01",
+      "max_date": "2020-12"
+    },
+    {
+      "dataset_id": "terraclimate_tmax",
+      "region_key": "-73.00_-15.00_-50.00_5.00",
+      "variable": "tmax",
+      "aggregation_method": "MONTHLY_GRIDDED_MEAN",
+      "data_provenance": "REAL_NASA_DATA",
+      "record_count": 66,
+      "min_date": "2015-01",
+      "max_date": "2020-06"
+    },
+    {
+      "dataset_id": "GPM_3IMERGM_07",
+      "region_key": "69.50_23.00_78.00_30.00",
+      "variable": "precipitationCal",
+      "aggregation_method": "SAMPLING_MIDMONTH_CHUNK",
+      "data_provenance": "REAL_NASA_DATA",
+      "record_count": 6,
+      "min_date": "2015-01",
+      "max_date": "2015-06"
+    },
+    {
+      "dataset_id": "TEST_GPM",
+      "region_key": "71.00_21.50_73.00_23.00",
+      "variable": "precipitationCal",
+      "aggregation_method": "FULL_30MIN_INTEGRAL",
+      "data_provenance": "REAL_NASA_DATA",
+      "record_count": 3,
+      "min_date": "2015-01",
+      "max_date": "2015-03"
+    },
+    {
+      "dataset_id": "TEST_GPM_LIFECYCLE",
+      "region_key": "71.00_21.50_73.00_23.00",
+      "variable": "precipitationCal",
+      "aggregation_method": "FULL_30MIN_INTEGRAL",
+      "data_provenance": "REAL_NASA_DATA",
+      "record_count": 3,
+      "min_date": "2015-01",
+      "max_date": "2015-03"
+    },
+    {
+      "dataset_id": "GPM_3IMERGM_07",
+      "region_key": "71.00_21.50_73.00_23.00",
+      "variable": "precipitationCal",
+      "aggregation_method": "FULL_30MIN_INTEGRAL",
+      "data_provenance": "REAL_NASA_DATA",
+      "record_count": 1,
+      "min_date": "2015-01",
+      "max_date": "2015-01"
+    },
+    {
+      "dataset_id": "GPM_3IMERGM_07_DAILY",
+      "region_key": "71.00_21.50_73.00_23.00",
+      "variable": "precipitationCal",
+      "aggregation_method": "FULL_30MIN_INTEGRAL",
+      "data_provenance": "REAL_NASA_DATA",
+      "record_count": 1,
+      "min_date": "2015-01-01",
+      "max_date": "2015-01-01"
+    }
+  ],
+  "annual_regions": []
+}
