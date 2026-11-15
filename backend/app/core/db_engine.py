@@ -69,6 +69,47 @@ class BaseDatabaseEngine(ABC):
         """Report audit summary of all cached series."""
         pass
 
+    @abstractmethod
+    def create_job(
+        self,
+        job_id: str,
+        cache_key: str,
+        status: str = "queued",
+        progress_pct: int = 0,
+        message: str = "",
+        request_payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Create and persist an analysis job record."""
+        pass
+
+    @abstractmethod
+    def update_job(
+        self,
+        job_id: str,
+        status: str,
+        progress_pct: int,
+        message: str,
+        result: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Update job status, progress, message, and result or error."""
+        pass
+
+    @abstractmethod
+    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve job record by job_id."""
+        pass
+
+    @abstractmethod
+    def get_job_by_cache_key(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        """Retrieve active job by cache_key."""
+        pass
+
+    @abstractmethod
+    def clean_expired_jobs(self, max_age_seconds: int = 86400):
+        """Purge jobs older than max_age_seconds."""
+        pass
+
 
 class SQLiteEngine(BaseDatabaseEngine):
     """
@@ -185,6 +226,23 @@ class SQLiteEngine(BaseDatabaseEngine):
 
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_monthly_lookup ON regional_monthly (dataset_id, region_key, date, variable)")
                 conn.execute("CREATE INDEX IF NOT EXISTS idx_annual_lookup ON regional_annual (dataset_id, region_key, year, variable)")
+
+                conn.execute("""
+                CREATE TABLE IF NOT EXISTS analysis_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    cache_key TEXT,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    progress_pct INTEGER DEFAULT 0,
+                    message TEXT,
+                    request_payload TEXT,
+                    result TEXT,
+                    error TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """)
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_cache_key ON analysis_jobs (cache_key)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON analysis_jobs (status)")
         finally:
             conn.close()
 
@@ -416,6 +474,164 @@ class SQLiteEngine(BaseDatabaseEngine):
         finally:
             conn.close()
 
+    def create_job(
+        self,
+        job_id: str,
+        cache_key: str,
+        status: str = "queued",
+        progress_pct: int = 0,
+        message: str = "",
+        request_payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        import json
+        payload_str = json.dumps(request_payload) if request_payload is not None else None
+        now_ts = datetime.now(timezone.utc).isoformat()
+        conn = self._get_connection()
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO analysis_jobs (
+                        job_id, cache_key, status, progress_pct, message,
+                        request_payload, result, error, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+                    ON CONFLICT(job_id) DO UPDATE SET
+                        status = excluded.status,
+                        progress_pct = excluded.progress_pct,
+                        message = excluded.message,
+                        request_payload = excluded.request_payload,
+                        updated_at = excluded.updated_at
+                    """,
+                    (job_id, cache_key, status, progress_pct, message, payload_str, now_ts, now_ts),
+                )
+            return {
+                "job_id": job_id,
+                "cache_key": cache_key,
+                "status": status,
+                "progress_pct": progress_pct,
+                "progress": progress_pct,
+                "message": message,
+                "request_payload": request_payload,
+                "result": None,
+                "error": None,
+                "created_at": now_ts,
+                "updated_at": now_ts,
+            }
+        finally:
+            conn.close()
+
+    def update_job(
+        self,
+        job_id: str,
+        status: str,
+        progress_pct: int,
+        message: str,
+        result: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        import json
+        now_ts = datetime.now(timezone.utc).isoformat()
+        res_str = json.dumps(result, default=str) if result is not None else None
+        conn = self._get_connection()
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    UPDATE analysis_jobs
+                    SET status = ?,
+                        progress_pct = ?,
+                        message = ?,
+                        result = COALESCE(?, result),
+                        error = COALESCE(?, error),
+                        updated_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (status, progress_pct, message, res_str, error, now_ts, job_id),
+                )
+            return self.get_job(job_id)
+        finally:
+            conn.close()
+
+    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        import json
+        conn = self._get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT job_id, cache_key, status, progress_pct, message,
+                       request_payload, result, error, created_at, updated_at
+                FROM analysis_jobs
+                WHERE job_id = ?
+                """,
+                (job_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            res = dict(row)
+            res["progress"] = res.get("progress_pct", 0)
+            if res.get("result"):
+                try:
+                    res["result"] = json.loads(res["result"])
+                except Exception:
+                    pass
+            if res.get("request_payload"):
+                try:
+                    res["request_payload"] = json.loads(res["request_payload"])
+                except Exception:
+                    pass
+            return res
+        finally:
+            conn.close()
+
+    def get_job_by_cache_key(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        import json
+        conn = self._get_connection()
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT job_id, cache_key, status, progress_pct, message,
+                       request_payload, result, error, created_at, updated_at
+                FROM analysis_jobs
+                WHERE cache_key = ? AND status IN ('queued', 'processing', 'running', 'completed')
+                ORDER BY created_at DESC LIMIT 1
+                """,
+                (cache_key,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            res = dict(row)
+            res["progress"] = res.get("progress_pct", 0)
+            if res.get("result"):
+                try:
+                    res["result"] = json.loads(res["result"])
+                except Exception:
+                    pass
+            if res.get("request_payload"):
+                try:
+                    res["request_payload"] = json.loads(res["request_payload"])
+                except Exception:
+                    pass
+            return res
+        finally:
+            conn.close()
+
+    def clean_expired_jobs(self, max_age_seconds: int = 86400):
+        conn = self._get_connection()
+        try:
+            with conn:
+                conn.execute(
+                    "DELETE FROM analysis_jobs WHERE datetime(created_at) < datetime('now', ?)",
+                    (f"-{max_age_seconds} seconds",),
+                )
+        except Exception as e:
+            logger.warning(f"Error cleaning expired SQLite jobs: {e}")
+        finally:
+            conn.close()
+
 
 class PostgreSQLEngine(BaseDatabaseEngine):
     """
@@ -540,6 +756,22 @@ class PostgreSQLEngine(BaseDatabaseEngine):
 
             CREATE INDEX IF NOT EXISTS idx_pg_monthly_lookup ON regional_monthly (dataset_id, region_key, date, variable);
             CREATE INDEX IF NOT EXISTS idx_pg_annual_lookup ON regional_annual (dataset_id, region_key, year, variable);
+
+            CREATE TABLE IF NOT EXISTS analysis_jobs (
+                job_id VARCHAR(64) PRIMARY KEY,
+                cache_key VARCHAR(128),
+                status VARCHAR(32) NOT NULL DEFAULT 'queued',
+                progress_pct INTEGER DEFAULT 0,
+                message TEXT,
+                request_payload TEXT,
+                result TEXT,
+                error TEXT,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_pg_jobs_cache_key ON analysis_jobs (cache_key);
+            CREATE INDEX IF NOT EXISTS idx_pg_jobs_status ON analysis_jobs (status);
             """
             if self._driver == "psycopg2":
                 with conn.cursor() as cur:
@@ -834,6 +1066,203 @@ class PostgreSQLEngine(BaseDatabaseEngine):
             }
         finally:
             conn.close()
+
+    def create_job(
+        self,
+        job_id: str,
+        cache_key: str,
+        status: str = "queued",
+        progress_pct: int = 0,
+        message: str = "",
+        request_payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        import json
+        payload_str = json.dumps(request_payload, default=str) if request_payload else None
+        now_ts = datetime.now(timezone.utc).isoformat()
+        conn = self._get_connection()
+        try:
+            sql = """
+            INSERT INTO analysis_jobs (
+                job_id, cache_key, status, progress_pct, message,
+                request_payload, created_at, updated_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            ON CONFLICT (job_id) DO UPDATE SET
+                cache_key = EXCLUDED.cache_key,
+                status = EXCLUDED.status,
+                progress_pct = EXCLUDED.progress_pct,
+                message = EXCLUDED.message,
+                request_payload = EXCLUDED.request_payload,
+                updated_at = CURRENT_TIMESTAMP
+            """
+            if self._driver == "psycopg2":
+                with conn.cursor() as cur:
+                    cur.execute(sql, (job_id, cache_key, status, progress_pct, message, payload_str))
+                conn.commit()
+            else:
+                conn.run(sql, job_id, cache_key, status, progress_pct, message, payload_str)
+            return {
+                "job_id": job_id,
+                "cache_key": cache_key,
+                "status": status,
+                "progress_pct": progress_pct,
+                "progress": progress_pct,
+                "message": message,
+                "request_payload": request_payload,
+                "result": None,
+                "error": None,
+                "created_at": now_ts,
+                "updated_at": now_ts,
+            }
+        finally:
+            conn.close()
+
+    def update_job(
+        self,
+        job_id: str,
+        status: str,
+        progress_pct: int,
+        message: str,
+        result: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        import json
+        res_str = json.dumps(result, default=str) if result is not None else None
+        conn = self._get_connection()
+        try:
+            sql = """
+            UPDATE analysis_jobs
+            SET status = %s,
+                progress_pct = %s,
+                message = %s,
+                result = COALESCE(%s, result),
+                error = COALESCE(%s, error),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE job_id = %s
+            """
+            if self._driver == "psycopg2":
+                with conn.cursor() as cur:
+                    cur.execute(sql, (status, progress_pct, message, res_str, error, job_id))
+                conn.commit()
+            else:
+                conn.run(sql, status, progress_pct, message, res_str, error, job_id)
+            return self.get_job(job_id)
+        finally:
+            conn.close()
+
+    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        import json
+        conn = self._get_connection()
+        try:
+            sql = """
+            SELECT job_id, cache_key, status, progress_pct, message,
+                   request_payload, result, error, created_at, updated_at
+            FROM analysis_jobs
+            WHERE job_id = %s
+            """
+            row = None
+            if self._driver == "psycopg2":
+                import psycopg2.extras
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(sql, (job_id,))
+                    res = cur.fetchone()
+                    if res:
+                        row = dict(res)
+            else:
+                cols = [
+                    "job_id", "cache_key", "status", "progress_pct", "message",
+                    "request_payload", "result", "error", "created_at", "updated_at"
+                ]
+                res = conn.run(sql, job_id)
+                if res:
+                    row = dict(zip(cols, res[0]))
+
+            if not row:
+                return None
+
+            row["progress"] = row.get("progress_pct", 0)
+            if row.get("result"):
+                try:
+                    row["result"] = json.loads(row["result"])
+                except Exception:
+                    pass
+            if row.get("request_payload"):
+                try:
+                    row["request_payload"] = json.loads(row["request_payload"])
+                except Exception:
+                    pass
+            if row.get("created_at"):
+                row["created_at"] = str(row["created_at"])
+            if row.get("updated_at"):
+                row["updated_at"] = str(row["updated_at"])
+            return row
+        finally:
+            conn.close()
+
+    def get_job_by_cache_key(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        import json
+        conn = self._get_connection()
+        try:
+            sql = """
+            SELECT job_id, cache_key, status, progress_pct, message,
+                   request_payload, result, error, created_at, updated_at
+            FROM analysis_jobs
+            WHERE cache_key = %s AND status IN ('queued', 'processing', 'running', 'completed')
+            ORDER BY created_at DESC LIMIT 1
+            """
+            row = None
+            if self._driver == "psycopg2":
+                import psycopg2.extras
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(sql, (cache_key,))
+                    res = cur.fetchone()
+                    if res:
+                        row = dict(res)
+            else:
+                cols = [
+                    "job_id", "cache_key", "status", "progress_pct", "message",
+                    "request_payload", "result", "error", "created_at", "updated_at"
+                ]
+                res = conn.run(sql, cache_key)
+                if res:
+                    row = dict(zip(cols, res[0]))
+
+            if not row:
+                return None
+
+            row["progress"] = row.get("progress_pct", 0)
+            if row.get("result"):
+                try:
+                    row["result"] = json.loads(row["result"])
+                except Exception:
+                    pass
+            if row.get("request_payload"):
+                try:
+                    row["request_payload"] = json.loads(row["request_payload"])
+                except Exception:
+                    pass
+            if row.get("created_at"):
+                row["created_at"] = str(row["created_at"])
+            if row.get("updated_at"):
+                row["updated_at"] = str(row["updated_at"])
+            return row
+        finally:
+            conn.close()
+
+    def clean_expired_jobs(self, max_age_seconds: int = 86400):
+        conn = self._get_connection()
+        try:
+            sql = f"DELETE FROM analysis_jobs WHERE created_at < CURRENT_TIMESTAMP - INTERVAL '{int(max_age_seconds)} seconds'"
+            if self._driver == "psycopg2":
+                with conn.cursor() as cur:
+                    cur.execute(sql)
+                conn.commit()
+            else:
+                conn.run(sql)
+        except Exception as e:
+            logger.warning(f"Error cleaning expired PostgreSQL jobs: {e}")
+        finally:
+            conn.close()
+
 
 
 def create_database_engine(db_path: str, parquet_dir: str) -> BaseDatabaseEngine:

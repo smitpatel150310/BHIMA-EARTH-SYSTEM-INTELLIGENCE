@@ -32,12 +32,15 @@ def migrate(sqlite_path: str, pg_url: str):
     monthly_rows = [dict(r) for r in s_cur.execute("SELECT * FROM regional_monthly").fetchall()]
     annual_rows = [dict(r) for r in s_cur.execute("SELECT * FROM regional_annual").fetchall()]
     daily_rows = [dict(r) for r in s_cur.execute("SELECT * FROM regional_daily").fetchall()]
+    has_jobs_table = s_cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='analysis_jobs'").fetchone()
+    job_rows = [dict(r) for r in s_cur.execute("SELECT * FROM analysis_jobs").fetchall()] if has_jobs_table else []
     s_conn.close()
 
     logger.info(f"Loaded from SQLite:")
     logger.info(f"  - regional_monthly: {len(monthly_rows)} records")
     logger.info(f"  - regional_annual:  {len(annual_rows)} records")
     logger.info(f"  - regional_daily:   {len(daily_rows)} records")
+    logger.info(f"  - analysis_jobs:    {len(job_rows)} records")
 
     # 2. Connect to PostgreSQL
     logger.info("Connecting to target PostgreSQL database...")
@@ -75,7 +78,29 @@ def migrate(sqlite_path: str, pg_url: str):
                 data_source=a.get("data_source", "Microsoft Planetary Computer"),
             )
 
-    # 5. Verify Target PostgreSQL row count
+    # 5. Migrate analysis jobs
+    if job_rows:
+        logger.info(f"Migrating {len(job_rows)} analysis job records to PostgreSQL...")
+        for j in job_rows:
+            engine.create_job(
+                job_id=j["job_id"],
+                cache_key=j.get("cache_key", ""),
+                status=j.get("status", "completed"),
+                progress_pct=j.get("progress_pct", 100),
+                message=j.get("message", ""),
+                request_payload=j.get("request_payload"),
+            )
+            if j.get("result") or j.get("error"):
+                engine.update_job(
+                    job_id=j["job_id"],
+                    status=j.get("status", "completed"),
+                    progress_pct=j.get("progress_pct", 100),
+                    message=j.get("message", ""),
+                    result=j.get("result"),
+                    error=j.get("error"),
+                )
+
+    # 6. Verify Target PostgreSQL row count
     stats = engine.get_storage_stats()
     logger.info("=" * 70)
     logger.info("MIGRATION VERIFICATION:")

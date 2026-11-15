@@ -7,30 +7,18 @@ from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, HTTPException, Depends, Query
 from app.core.data_access import NASADataAccessor, NASADataAccessError
 from app.core.analysis import ScientificAnalysisEngine, AnalysisError
-from app.core.persistent_cache import persistent_store, get_region_key, generate_cache_key
+from app.core.job_store import job_store
+from app.core.persistent_cache import (
+    persistent_store,
+    get_region_key,
+    generate_cache_key,
+    get_inflight_lock,
+)
 from app.models.schemas import TimeSeriesRequest, ComparisonRequest
 from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/analysis", tags=["analysis"])
-
-
-class JobState:
-    def __init__(self, job_id: str, cache_key: str):
-        self.job_id = job_id
-        self.cache_key = cache_key
-        self.status = "processing"  # "processing" | "completed" | "failed"
-        self.progress_pct = 5
-        self.message = "Connecting to NASA Earth observation archive..."
-        self.result: Optional[Dict[str, Any]] = None
-        self.error: Optional[str] = None
-        self.created_at = time.time()
-        self.updated_at = time.time()
-
-
-_jobs: Dict[str, JobState] = {}
-_jobs_lock = threading.Lock()
-_jobs_by_cache_key: Dict[str, str] = {}
 
 
 def get_accessor():
@@ -165,49 +153,62 @@ async def get_timeseries(
             start_date=request.start_date,
             end_date=request.end_date,
         )
-        with _jobs_lock:
-            existing_job_id = _jobs_by_cache_key.get(cache_key)
-            if existing_job_id and existing_job_id in _jobs:
-                job = _jobs[existing_job_id]
-                if job.status == "processing":
-                    return {
-                        "job_id": job.job_id,
-                        "status": "processing",
-                        "progress_pct": job.progress_pct,
-                        "message": job.message,
-                    }
-                elif job.status == "completed" and job.result:
-                    return job.result
 
-            job_id = str(uuid.uuid4())[:12]
-            job = JobState(job_id=job_id, cache_key=cache_key)
-            _jobs[job_id] = job
-            _jobs_by_cache_key[cache_key] = job_id
+        existing_job = job_store.get_job_by_cache_key(cache_key)
+        if existing_job:
+            if existing_job.get("status") == "completed" and existing_job.get("result"):
+                logger.info(f"[JobStore] Returning completed job result for cache_key {cache_key}")
+                return existing_job["result"]
+            elif existing_job.get("status") in ("queued", "processing", "running"):
+                logger.info(f"[JobStore] Returning existing active job {existing_job['job_id']} for cache_key {cache_key}")
+                return {
+                    "job_id": existing_job["job_id"],
+                    "status": existing_job["status"],
+                    "progress_pct": existing_job["progress_pct"],
+                    "progress": existing_job["progress"],
+                    "message": existing_job["message"],
+                }
+
+        job_id = f"bhima-{uuid.uuid4().hex[:12]}"
+        req_payload = request.model_dump() if hasattr(request, "model_dump") else request.dict()
+
+        job_store.create_job(
+            job_id=job_id,
+            cache_key=cache_key,
+            status="processing",
+            progress_pct=10,
+            message=f"Extracting {len(missing_months)} missing months from Microsoft Planetary Computer archive...",
+            request_payload=req_payload,
+        )
 
         def _run_job_bg(j_id: str, req: TimeSeriesRequest):
             try:
+                logger.info(f"[Worker] Background extraction started for job {j_id}")
                 res = _run_timeseries_analysis(req, accessor, engine)
-                with _jobs_lock:
-                    if j_id in _jobs:
-                        _jobs[j_id].status = "completed"
-                        _jobs[j_id].progress_pct = 100
-                        _jobs[j_id].message = "Analysis completed successfully."
-                        _jobs[j_id].result = res
-                        _jobs[j_id].updated_at = time.time()
+                job_store.update_job(
+                    job_id=j_id,
+                    status="completed",
+                    progress_pct=100,
+                    message="Analysis completed successfully.",
+                    result=res,
+                )
+                logger.info(f"[Worker] Background extraction for job {j_id} finished successfully")
             except Exception as ex:
-                logger.error(f"Background analysis job {j_id} failed: {ex}", exc_info=True)
-                with _jobs_lock:
-                    if j_id in _jobs:
-                        _jobs[j_id].status = "failed"
-                        _jobs[j_id].error = str(ex)
-                        _jobs[j_id].message = f"Analysis failed: {str(ex)}"
-                        _jobs[j_id].updated_at = time.time()
+                logger.error(f"[Worker] Background analysis job {j_id} failed: {ex}", exc_info=True)
+                job_store.update_job(
+                    job_id=j_id,
+                    status="failed",
+                    progress_pct=100,
+                    message=f"Analysis failed: {str(ex)}",
+                    error=str(ex),
+                )
 
         threading.Thread(target=_run_job_bg, args=(job_id, request), daemon=True).start()
         return {
             "job_id": job_id,
             "status": "processing",
             "progress_pct": 10,
+            "progress": 10,
             "message": f"Extracting {len(missing_months)} missing months from Microsoft Planetary Computer archive...",
         }
 
@@ -226,22 +227,121 @@ async def get_timeseries(
 
 
 @router.get("/jobs/{job_id}")
-async def get_analysis_job_status(job_id: str):
-    """Poll status of an asynchronous analysis job."""
-    with _jobs_lock:
-        job = _jobs.get(job_id)
-        if not job:
-            raise HTTPException(status_code=404, detail=f"Analysis job {job_id} not found.")
+async def get_analysis_job_status(
+    job_id: str,
+    accessor: NASADataAccessor = Depends(get_accessor),
+    engine: ScientificAnalysisEngine = Depends(get_engine),
+):
+    """
+    Poll status of an asynchronous analysis job.
+    Retrieves state from persistent database engine.
+    If the worker was frozen by serverless execution lifecycle, seamlessly completes
+    computation during this active polling invocation.
+    """
+    job = job_store.get_job(job_id)
+    if not job:
+        logger.warning(f"[JobStore] Job ID '{job_id}' not found in persistent store")
+        raise HTTPException(status_code=404, detail=f"Analysis job {job_id} not found.")
+
+    status = job.get("status", "queued")
+
+    # Completed or Failed: return immediately
+    if status in ("completed", "failed"):
         return {
-            "job_id": job.job_id,
-            "status": job.status,
-            "progress_pct": job.progress_pct,
-            "message": job.message,
-            "result": job.result,
-            "error": job.error,
-            "created_at": job.created_at,
-            "updated_at": job.updated_at,
+            "job_id": job["job_id"],
+            "status": status,
+            "progress_pct": job.get("progress_pct", 100),
+            "progress": job.get("progress_pct", 100),
+            "message": job.get("message", ""),
+            "result": job.get("result"),
+            "error": job.get("error"),
+            "created_at": job.get("created_at"),
+            "updated_at": job.get("updated_at"),
         }
+
+    # If still processing / queued and request payload is available:
+    req_payload = job.get("request_payload")
+    if req_payload and isinstance(req_payload, dict):
+        try:
+            req = TimeSeriesRequest(**req_payload)
+            reg_key = get_region_key(
+                req.region.min_lon,
+                req.region.min_lat,
+                req.region.max_lon,
+                req.region.max_lat,
+            )
+
+            # Check if all months are now present in cache
+            cached_recs, missing_months, _ = persistent_store.get_monthly_series(
+                dataset_id=req.dataset_id,
+                region_key=reg_key,
+                start_date=req.start_date,
+                end_date=req.end_date,
+            )
+
+            if len(missing_months) == 0:
+                logger.info(f"[JobStore] All observations in cache for job {job_id}. Completing analysis...")
+                res = await asyncio.to_thread(_run_timeseries_analysis, req, accessor, engine)
+                updated = job_store.update_job(
+                    job_id=job_id,
+                    status="completed",
+                    progress_pct=100,
+                    message="Analysis completed successfully.",
+                    result=res,
+                )
+                return updated or job
+
+            # If background worker was frozen in serverless environment, take over execution safely
+            lock = get_inflight_lock(f"job_exec_{job_id}")
+            if lock.acquire(blocking=False):
+                try:
+                    logger.info(
+                        f"[JobStore] Taking over serverless execution for job {job_id} "
+                        f"({len(missing_months)} missing months)..."
+                    )
+                    job_store.update_job(
+                        job_id=job_id,
+                        status="processing",
+                        progress_pct=50,
+                        message=f"Extracting {len(missing_months)} missing months from Microsoft Planetary Computer archive...",
+                    )
+                    res = await asyncio.to_thread(_run_timeseries_analysis, req, accessor, engine)
+                    updated = job_store.update_job(
+                        job_id=job_id,
+                        status="completed",
+                        progress_pct=100,
+                        message="Analysis completed successfully.",
+                        result=res,
+                    )
+                    return updated or job
+                except Exception as ex:
+                    logger.error(f"[JobStore] Polling execution for job {job_id} failed: {ex}", exc_info=True)
+                    updated = job_store.update_job(
+                        job_id=job_id,
+                        status="failed",
+                        progress_pct=100,
+                        message=f"Analysis failed: {str(ex)}",
+                        error=str(ex),
+                    )
+                    return updated or job
+                finally:
+                    lock.release()
+
+        except Exception as ex:
+            logger.warning(f"[JobStore] Error checking payload for job {job_id}: {ex}")
+
+    return {
+        "job_id": job["job_id"],
+        "status": status,
+        "progress_pct": job.get("progress_pct", 10),
+        "progress": job.get("progress_pct", 10),
+        "message": job.get("message", "Processing NASA Earth observations..."),
+        "result": None,
+        "error": None,
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+    }
+
 
 
 @router.post("/compare")

@@ -171,7 +171,6 @@ def init_persistent_store():
             )
             """)
 
-            # Indices
             conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_monthly_lookup
             ON regional_monthly (dataset_id, region_key, date, variable)
@@ -180,6 +179,23 @@ def init_persistent_store():
             CREATE INDEX IF NOT EXISTS idx_annual_lookup
             ON regional_annual (dataset_id, region_key, year, variable)
             """)
+
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS analysis_jobs (
+                job_id TEXT PRIMARY KEY,
+                cache_key TEXT,
+                status TEXT NOT NULL DEFAULT 'queued',
+                progress_pct INTEGER DEFAULT 0,
+                message TEXT,
+                request_payload TEXT,
+                result TEXT,
+                error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_cache_key ON analysis_jobs (cache_key)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON analysis_jobs (status)")
     finally:
         conn.close()
 
@@ -353,6 +369,56 @@ class PersistentObservationStore:
         last extraction timestamps, and storage sizes from active engine.
         """
         return self.engine.get_cache_summary()
+
+    def create_job(
+        self,
+        job_id: str,
+        cache_key: str,
+        status: str = "queued",
+        progress_pct: int = 0,
+        message: str = "",
+        request_payload: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Create and persist an analysis job."""
+        return self.engine.create_job(
+            job_id=job_id,
+            cache_key=cache_key,
+            status=status,
+            progress_pct=progress_pct,
+            message=message,
+            request_payload=request_payload,
+        )
+
+    def update_job(
+        self,
+        job_id: str,
+        status: str,
+        progress_pct: int,
+        message: str,
+        result: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Update job progress and result or error."""
+        return self.engine.update_job(
+            job_id=job_id,
+            status=status,
+            progress_pct=progress_pct,
+            message=message,
+            result=result,
+            error=error,
+        )
+
+    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve job record by job_id."""
+        return self.engine.get_job(job_id=job_id)
+
+    def get_job_by_cache_key(self, cache_key: str) -> Optional[Dict[str, Any]]:
+        """Retrieve active job by cache_key."""
+        return self.engine.get_job_by_cache_key(cache_key=cache_key)
+
+    def clean_expired_jobs(self, max_age_seconds: int = 86400):
+        """Purge jobs older than max_age_seconds."""
+        return self.engine.clean_expired_jobs(max_age_seconds=max_age_seconds)
 
 
 # Global singleton instance
