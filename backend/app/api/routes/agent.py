@@ -10,6 +10,8 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/agent", tags=["agent"])
 
 
+import os
+
 def get_agent():
     settings = get_settings()
     accessor = NASADataAccessor(
@@ -17,8 +19,10 @@ def get_agent():
         password=settings.nasa_earthdata_password
     )
     engine = ScientificAnalysisEngine()
+    # Explicitly prioritize GEMINI_API_KEY from server environment
+    api_key = os.environ.get("GEMINI_API_KEY") or settings.gemini_api_key
     return BHIMAAgent(
-        api_key=settings.gemini_api_key,
+        api_key=api_key,
         data_accessor=accessor,
         analysis_engine=engine
     )

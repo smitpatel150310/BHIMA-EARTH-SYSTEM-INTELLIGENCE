@@ -1,7 +1,14 @@
 import os
 from functools import lru_cache
 from typing import List
+from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
+
+# Automatically load environment from current directory or backend/.env
+load_dotenv()
+_backend_env = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "backend", ".env")
+if os.path.exists(_backend_env):
+    load_dotenv(_backend_env)
 
 
 class Settings(BaseSettings):
