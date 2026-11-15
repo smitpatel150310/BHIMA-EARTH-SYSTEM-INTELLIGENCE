@@ -52,8 +52,7 @@ backend/scratch/
 *.sqlite3
 *.parquet
 *.zarr
-backend/data/storage/
-backend/data/raw_parquet/
+
 
 # Generated files
 *.timestamp-*.js
